@@ -4,6 +4,7 @@ require 'eventmachine'
 require 'socket'
 require 'fileutils'
 require 'digest/md5'
+require 'sdbm'
 
 module MemcacheFS
 
@@ -11,6 +12,7 @@ module MemcacheFS
     DEFAULT_HOST    = '127.0.0.1'
     DEFAULT_PORT    = 33133
     DEFAULT_PATH    = "/tmp/memcachefs"
+    DEFAULT_FILE    = "memcachefs.db"
     DEFAULT_TIMEOUT = 60
 
     def self.start(opts = {})
@@ -24,17 +26,19 @@ module MemcacheFS
         :host    => DEFAULT_HOST,
         :port    => DEFAULT_PORT,
         :path    => DEFAULT_PATH,
+        :file    => DEFAULT_FILE,
         :timeout => DEFAULT_TIMEOUT,
         :server  => self
       }.merge(opts)
       FileUtils.mkdir_p(@opts[:path])
+      @db = SDBM.new File.join(@opts[:path], @opts[:file])
     end
 
     def start
       EventMachine.epoll
       EventMachine.set_descriptor_table_size(4096)
       EventMachine.run do
-        EventMachine.start_server(@opts[:host], @opts[:port], MemcacheFS::ConnectionHandler, @opts)
+        EventMachine.start_server(@opts[:host], @opts[:port], MemcacheFS::ConnectionHandler, { :opts => @opts, :db => @db })
         puts "Started MemcacheFS on #{@opts[:host]}:#{@opts[:port]}..."
       end
     end
@@ -56,6 +60,7 @@ module MemcacheFS
     DELETE_COMMAND        = /\Adelete (.{1,250}) ([0-9]+)\r\n/m
     SHUTDOWN_COMMAND      = /\Ashutdown\r\n/m
     QUIT_COMMAND          = /\Aquit\r\n/m
+    FLUSH_ALL_COMMAND     = /\Aflush_all\r\n/m
     # response pragmas
     ERR_UNKNOWN_COMMAND   = "CLIENT_ERROR bad command line format\r\n".freeze
     GET_RESPONSE          = "VALUE %s %s %s\r\n%s\r\nEND\r\n".freeze
@@ -64,11 +69,13 @@ module MemcacheFS
     SET_RESPONSE_FAILURE  = "NOT STORED\r\n".freeze
     DELETE_RESPONSE       = "END\r\n".freeze
     NOT_FOUND_RESPONSE    = "NOT_FOUND\r\n".freeze
+    OK_RESPONSE           = "OK\r\n".freeze
 
     @@next_session_id = 1
 
     def initialize(options = {})
-      @opts = options
+      @opts = options[:opts]
+      @db = options[:db]
     end
 
     def post_init
@@ -116,6 +123,8 @@ module MemcacheFS
         when QUIT_COMMAND
           close_connection
           return nil
+        when FLUSH_ALL_COMMAND
+          flush_all
         else
           respond ERR_UNKNOWN_COMMAND
       end
@@ -134,9 +143,8 @@ module MemcacheFS
 
     def get(key)
       puts "--> (#{@session_id}) GET #{key}"
-      p = path_for(key)
-      if File.exists?(p)
-        data = File.read(p)
+      data = @db[key]
+      if !data.nil?
         puts "<-- (#{@session_id}) #{data.size}: " + data[0..30].gsub(/[\n\r]+/, ' ')
         respond GET_RESPONSE, key, 0, data.size, data
       else
@@ -158,10 +166,8 @@ module MemcacheFS
       @stash = []
       @expected_length = nil
 
-      p = path_for(key)
       begin
-        FileUtils.mkdir_p(File.dirname(p))
-        File.open(p, 'w+') { |f| f.write(value) }
+        @db[key] = data
         puts "<-- (#{@session_id}) " + SET_RESPONSE_SUCCESS
         respond SET_RESPONSE_SUCCESS
       rescue
@@ -172,9 +178,8 @@ module MemcacheFS
 
     def delete(key)
       puts "--> (#{@session_id}) DELETE #{key}"
-      p = path_for(key)
-      if File.exists?(p)
-        File.delete p if File.exists?(p)
+      if @db.has_key? key
+        @db.delete key
         puts "<-- (#{@session_id}) " + DELETE_RESPONSE
         respond DELETE_RESPONSE
       else
@@ -183,14 +188,15 @@ module MemcacheFS
       end
     end
 
-    def respond(str, *args)
-      send_data sprintf(str, *args)
+    def flush_all
+      puts "--> (#{@session_id}) FLUSH_ALL"
+      @db.clear
+      puts "<-- (#{@session_id}) " + OK_RESPONSE
+      respond OK_RESPONSE
     end
 
-    def path_for(key)
-      hash = Digest::MD5.hexdigest(key)
-      dirs = hash.scan(/../)[0..1]
-      File.join(@opts[:path], dirs, hash)
+    def respond(str, *args)
+      send_data sprintf(str, *args)
     end
 
   end # class ConnectionHandler
